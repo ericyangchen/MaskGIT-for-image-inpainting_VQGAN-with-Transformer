@@ -3,4 +3,8 @@
 
 data
 
+models/VQGAN/checkpoints
+
+outputs
+
 .nfs*
