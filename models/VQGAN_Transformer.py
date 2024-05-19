@@ -8,7 +8,6 @@ from .VQGAN import VQGAN
 from .Transformer import BidirectionalTransformer
 
 
-# TODO2 step1: design the MaskGIT model
 class MaskGit(nn.Module):
     def __init__(self, configs):
         super().__init__()
@@ -18,10 +17,21 @@ class MaskGit(nn.Module):
         self.mask_token_id = configs["num_codebook_vectors"]
         self.choice_temperature = configs["choice_temperature"]
         self.gamma = self.gamma_func(configs["gamma_type"])
+        print(f"Using {configs['gamma_type']} mask scheduling function")
         self.transformer = BidirectionalTransformer(configs["Transformer_param"])
 
     def load_transformer_checkpoint(self, load_ckpt_path):
-        self.transformer.load_state_dict(torch.load(load_ckpt_path))
+        print(f"Loading transformer checkpoint from {load_ckpt_path}")
+
+        VQGANTransformer_state_dict = torch.load(load_ckpt_path)
+
+        transformer_state_dict = {
+            k.replace("transformer.", ""): v
+            for k, v in VQGANTransformer_state_dict.items()
+            if k.startswith("transformer.")
+        }
+
+        self.transformer.load_state_dict(transformer_state_dict)
 
     @staticmethod
     def load_vqgan(configs):
@@ -31,14 +41,17 @@ class MaskGit(nn.Module):
         model = model.eval()
         return model
 
-    ##TODO2 step1-1: input x fed to vqgan encoder to get the latent and zq
     @torch.no_grad()
     def encode_to_z(self, x):
-        raise Exception("TODO2 step1-1!")
-        return None
+        # z: b,c,h,w, z_indices: b*c
+        z, z_indices, _ = self.vqgan.encode(x)
 
-    ##TODO2 step1-2:
-    def gamma_func(self, mode="cosine"):
+        # reshape z_indices to (b, c)
+        z_indices = z_indices.reshape(z.shape[0], z.shape[1])
+
+        return z, z_indices
+
+    def gamma_func(self, mode):
         """Generates a mask rate by scheduling mask functions R.
 
         Given a ratio in [0, 1), we generate a masking ratio from (0, 1].
@@ -50,49 +63,77 @@ class MaskGit(nn.Module):
         Returns: The mask rate (float).
 
         """
+        def linear_schedule(t_T):
+            return 1 - t_T
+
+        def cosine_schedule(t_T):
+            return (1 + math.cos(math.pi * t_T)) * 0.5
+
+        def square_schedule(t_T):
+            return 1 - t_T**2
+
         if mode == "linear":
-            raise Exception("TODO2 step1-2!")
-            return None
+            return linear_schedule
         elif mode == "cosine":
-            raise Exception("TODO2 step1-2!")
-            return None
+            return cosine_schedule
         elif mode == "square":
-            raise Exception("TODO2 step1-2!")
-            return None
+            return square_schedule
         else:
             raise NotImplementedError
 
-    ##TODO2 step1-3:
     def forward(self, x):
+        z, z_indices = self.encode_to_z(x)
 
-        z_indices = None  # ground truth
-        logits = None  # transformer predict the probability of tokens
-        raise Exception("TODO2 step1-3!")
+        # randomly mask tokens for training
+        ratio = np.random.rand()
+        mask = torch.rand_like(z_indices.float()) < ratio
+        masked_z_indices = z_indices.clone()
+        masked_z_indices[mask] = self.mask_token_id
+
+        logits = self.transformer(masked_z_indices)
+
         return logits, z_indices
 
-    ##TODO3 step1-1: define one iteration decoding
     @torch.no_grad()
-    def inpainting(self):
-        raise Exception("TODO3 step1-1!")
-        logits = self.transformer(None)
-        # Apply softmax to convert logits into a probability distribution across the last dimension.
-        logits = None
+    def inpainting(self, t_T, z_indices, mask, initial_mask_num):
+        # mask z_indices with current mask
+        masked_z_indices = z_indices.clone()
+        masked_z_indices[mask] = self.mask_token_id
+
+        # predict new z_indices
+        logits = self.transformer(masked_z_indices)
+
+        # convert to probability
+        logits = torch.softmax(logits, dim=-1)
 
         # FIND MAX probability for each token value
-        z_indices_predict_prob, z_indices_predict = None
+        z_indices_predict_prob, z_indices_predict = torch.max(logits, dim=-1)
 
-        ratio = None
+        # turn t/T to mask scheduling ratio
+        ratio = self.gamma(t_T)
+
+        # gumbel noise
+        gumbel_noise = -torch.log(-torch.log(torch.rand_like(z_indices_predict_prob)))
+
         # predicted probabilities add temperature annealing gumbel noise as confidence
-        g = None  # gumbel noise
-        temperature = self.choice_temperature * (1 - ratio)
-        confidence = z_indices_predict_prob + temperature * g
+        temperature = self.choice_temperature * ratio
+        confidence = z_indices_predict_prob + temperature * gumbel_noise
 
-        # hint: If mask is False, the probability should be set to infinity, so that the tokens are not affected by the transformer's prediction
-        # sort the confidence for the rank
-        # define how much the iteration remain predicted tokens by mask scheduling
-        # At the end of the decoding process, add back the original token values that were not masked to the predicted tokens
-        mask_bc = None
-        return z_indices_predict, mask_bc
+        confidence[~mask] = float("-inf")
+
+        sorted_confidence, indices = torch.sort(confidence, descending=True)
+
+        # get the number of new tokens that can be updated in this iteration
+        total_should_mask_num = initial_mask_num * ratio
+        num_of_new_prediction = int(
+            (torch.sum(mask == True) - total_should_mask_num).item()
+        )
+
+        # update newly predicted tokens with mask = False
+        updated_mask = mask.clone()
+        updated_mask[0][indices[0][:num_of_new_prediction]] = False
+
+        return z_indices_predict, updated_mask
 
 
 __MODEL_TYPE__ = {"MaskGit": MaskGit}
